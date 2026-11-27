@@ -500,7 +500,9 @@ impl DbConnectService {
     ) -> ServiceResult<()> {
         if recipient_user_ids.is_empty() {
             warn!(
+                kind = ?kind,
                 request_ids = ?request_ids,
+                applicant_actor_id = %applicant_actor_id,
                 target_bot_id = %target_bot_id,
                 env = %self.env,
                 "friend connect notification skipped: no recipients"

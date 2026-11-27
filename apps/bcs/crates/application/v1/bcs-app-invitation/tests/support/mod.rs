@@ -431,10 +431,36 @@ impl ConnectService for FakeConnectService {
 
     async fn list_friends_paginated(
         &self,
-        _actor: &str,
-        _query: FriendListQuery,
+        actor: &str,
+        query: FriendListQuery,
     ) -> ServiceResult<FriendEntriesPage> {
-        unreachable!("the V1 friendship facade must not call list_friends_paginated")
+        let entries: Vec<_> = lock(&self.friendships)
+            .iter()
+            .flat_map(|(left, right)| [(left.clone(), right.clone()), (right.clone(), left.clone())])
+            .filter(|(side, _)| side == actor)
+            .map(|(_, peer)| {
+                let kind = if peer.starts_with("human_") {
+                    bcs_domain::actor::ActorKind::Human
+                } else {
+                    bcs_domain::actor::ActorKind::Bot
+                };
+                EdgeFriendListEntry {
+                    actor_id: peer,
+                    kind,
+                    name: None,
+                    summary: None,
+                    is_online: false,
+                }
+            })
+            .filter(|entry| query.target_type.is_none_or(|kind| kind == entry.kind))
+            .collect();
+        let total = entries.len() as u64;
+        let items = entries
+            .into_iter()
+            .skip(query.offset as usize)
+            .take(query.limit as usize)
+            .collect();
+        Ok(FriendEntriesPage { items, total })
     }
 
     async fn list_requests(

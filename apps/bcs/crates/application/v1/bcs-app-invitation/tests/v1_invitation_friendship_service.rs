@@ -2573,6 +2573,56 @@ async fn owner_remove_lists_and_revokes_open_strategy_friendships() {
 }
 
 #[tokio::test]
+async fn manager_keeps_friend_listing_while_owner_removal_is_denied() {
+    // CF-2 的分野：读面保持 can_manage act-as(manager 可列表）,写面（移除）仅
+    // Owner。两颗扣子都钉住，防"顺手把读面也收成 require_owner"的静默回归。
+    use bcs_service_api::application::v1::{
+        DeleteFriendConnection, FriendConnectionActor, FriendConnectionActorType as Kind,
+        FriendConnectionService, ListFriendConnections,
+    };
+    let fx = Fixture::new().await;
+    fx.add_bot("bot-b").await; // owner staff-2
+    bcs_test_support::grant_manager_edge(&fx.authority_repo, "bot-b", "staff-9").await;
+    fx.connect.add_friendship("bot-b", "friend-bot");
+
+    let page = fx
+        .service
+        .list_friend_connections(ListFriendConnections {
+            caller: Fixture::human_principal("staff-9"),
+            actor: FriendConnectionActor {
+                actor_type: Kind::Bot,
+                id: "bot-b".into(),
+            },
+            target_type: None,
+            page: 1,
+            page_size: 20,
+        })
+        .await
+        .expect("a manager keeps the can_manage act-as listing");
+    assert_eq!(page.total, 1);
+    assert_eq!(page.items[0].actor.actor_type, Kind::Bot);
+    assert_eq!(page.items[0].actor.id, "friend-bot");
+
+    let error = fx
+        .service
+        .delete_friend_connection(DeleteFriendConnection {
+            caller: Fixture::human_principal("staff-9"),
+            actor: Some(FriendConnectionActor {
+                actor_type: Kind::Bot,
+                id: "bot-b".into(),
+            }),
+            target_actor: FriendConnectionActor {
+                actor_type: Kind::Bot,
+                id: "friend-bot".into(),
+            },
+            request_auth: None,
+        })
+        .await
+        .expect_err("…while the destructive direction stays Owner-only");
+    assert_code(error, "forbidden");
+}
+
+#[tokio::test]
 async fn owner_remove_rejects_a_human_actor_or_empty_bot_id() {
     use bcs_service_api::application::v1::{
         DeleteFriendConnection, FriendConnectionActor, FriendConnectionActorType as Kind,

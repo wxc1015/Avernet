@@ -561,6 +561,52 @@ use super::*;
     }
 
     #[tokio::test]
+    async fn removed_by_owner_concurrent_bot_removals_emit_at_most_one_notice() {
+        // D4 / acceptance ②: a bot↔bot friendship is TWO directed edges, so a
+        // naive "notify when I transitioned anything" can double-notify when
+        // the two racers split the pair. The guarantee under every schedule:
+        // at most one notice, both edges transitioned by someone, and the
+        // call that notifies transitioned the whole pair.
+        let (eg, pp, rq, bc, db) = assemble().await;
+        seed_bot(&db, "x:raceA", "protected", "protected", "OPEN", "online", Some("85020")).await;
+        seed_bot(&db, "x:raceB", "protected", "protected", "OPEN", "online", Some("85020")).await;
+        let recorder = RecordingFriendConnectNotificationPort::default();
+        let events = recorder.events.clone();
+        let svc = service_with_notification(&eg, &pp, &rq, &bc, Arc::new(recorder));
+        svc.create_connect("x:raceA", "x:raceB", None, None)
+            .await
+            .expect("bot↔bot auto friendship");
+
+        let (left, right) = tokio::join!(
+            svc.revoke_friend_as_owner("x:raceA", "x:raceB", None),
+            svc.revoke_friend_as_owner("x:raceA", "x:raceB", None),
+        );
+        let results = [
+            left.expect("first concurrent removal"),
+            right.expect("second concurrent removal"),
+        ];
+        assert_eq!(
+            results.iter().map(Vec::len).sum::<usize>(),
+            2,
+            "both directed edges transitioned exactly once across the two calls"
+        );
+        assert!(!eg.has_friend_edge("x:raceA", "x:raceB", "dev").await);
+
+        let events = events.lock().await;
+        assert!(
+            events.len() <= 1,
+            "at most one notice per removal pair, never a duplicate: {events:?}"
+        );
+        if events.len() == 1 {
+            assert_eq!(
+                events[0].request_ids.len(),
+                2,
+                "the notifying call transitioned the whole pair"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn list_friends_after_connect() {
         let (eg, pp, rq, bc, db) = assemble().await;
         seed_bot(&db, "x:lf1", "protected", "protected", "OPEN", "online", Some("85020")).await;

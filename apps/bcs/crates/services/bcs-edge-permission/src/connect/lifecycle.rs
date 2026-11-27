@@ -643,6 +643,7 @@ impl ConnectService for DbConnectService {
         request_auth: Option<RequestAuthHeaders>,
     ) -> ServiceResult<Vec<u64>> {
         let mut revoked: Vec<u64> = Vec::new();
+        let mut candidates = 0usize;
 
         // Forward: first → second, ref == second's default profile id.
         if let Some(second_default) = self
@@ -657,6 +658,7 @@ impl ConnectService for DbConnectService {
             for g in forward {
                 if g.grant_ref_id == second_default && g.grant_kind == GrantKind::PermissionProfile
                 {
+                    candidates += 1;
                     if self
                         .edge_grants
                         .revoke_grant_if_active(g.edge_id, &self.env)
@@ -682,6 +684,7 @@ impl ConnectService for DbConnectService {
             for g in reverse {
                 if g.grant_ref_id == first_default && g.grant_kind == GrantKind::PermissionProfile
                 {
+                    candidates += 1;
                     if self
                         .edge_grants
                         .revoke_grant_if_active(g.edge_id, &self.env)
@@ -730,58 +733,74 @@ impl ConnectService for DbConnectService {
             return Ok(revoked);
         }
 
+        // At-most-one-notice (D4): a bot↔bot friendship is TWO directed
+        // edges, and two genuinely concurrent removals can split the pair
+        // (each racer transitions one edge). Only the call that transitioned
+        // its WHOLE observed candidate set notifies. The race-loser of a
+        // split pair stays silent and leaves a WARN — the lost-notice corner
+        // degrades into the same best-effort envelope the design documents
+        // for intake failures, and never produces a duplicate notice.
+        if revoked.len() < candidates {
+            warn!(
+                first = %first,
+                second = %second,
+                transitioned = revoked.len(),
+                candidates,
+                "owner removal raced a concurrent removal: partial transition set; \
+                 the RemovedByOwner notice is left to the completing call (if any)"
+            );
+            return Ok(revoked);
+        }
+
         // One `RemovedByOwner` notice for the transitioned set, addressed to
         // the removed party (or the removed Bot's CURRENT owner). The
         // applicant actor drives the adapter's HUMAN2BOT/BOT2BOT event-type
         // split (pinned by the bcs crate's payload tests).
         let request_ids: Vec<String> = revoked.iter().map(u64::to_string).collect();
-        let notified = match actor_kind_of(first) {
-            ActorKind::Human => {
-                let staff_no = first.strip_prefix("human_").unwrap_or(first).to_string();
-                self.emit_friend_connect_notification(
-                    FriendConnectNotificationKind::RemovedByOwner,
-                    request_ids.clone(),
-                    first,
-                    second,
-                    vec![staff_no],
-                    None,
-                    request_auth,
-                )
-                .await
-            }
+        let (applicant_actor_id, target_bot_id, recipient_user_ids) = match actor_kind_of(first) {
+            ActorKind::Human => (
+                first,
+                second,
+                vec![first.strip_prefix("human_").unwrap_or(first).to_string()],
+            ),
             ActorKind::Bot => match self.bot_config.get(second, &self.env).await {
                 Some(cfg) => {
                     let recipients = self.target_notification_recipients(second, &cfg).await;
-                    self.emit_friend_connect_notification(
-                        FriendConnectNotificationKind::RemovedByOwner,
-                        request_ids.clone(),
-                        second,
-                        first,
-                        recipients,
-                        None,
-                        request_auth,
-                    )
-                    .await
+                    (second, first, recipients)
                 }
                 None => {
                     warn!(
                         bot_id = %second,
+                        managed_bot_id = %first,
                         env = %self.env,
                         "RemovedByOwner notice skipped: the removed Bot's config \
                          is unavailable; recipients are unresolvable"
                     );
-                    Ok(())
+                    return Ok(revoked);
                 }
             },
         };
-        // Best-effort (Review Focus #4): a notification failure must not roll
-        // back the removal — the edges already transitioned.
-        if let Err(error) = notified {
+        if let Err(error) = self
+            .emit_friend_connect_notification(
+                FriendConnectNotificationKind::RemovedByOwner,
+                request_ids.clone(),
+                applicant_actor_id,
+                target_bot_id,
+                recipient_user_ids.clone(),
+                None,
+                request_auth,
+            )
+            .await
+        {
+            // Best-effort (Review Focus #4): a notification failure must not
+            // roll back the removal — the edges already transitioned; the
+            // WARN names the intended recipients so the loss is diagnosable.
             warn!(
                 error = %error,
                 request_ids = ?request_ids,
-                first = %first,
-                second = %second,
+                applicant_actor_id = %applicant_actor_id,
+                target_bot_id = %target_bot_id,
+                recipient_user_ids = ?recipient_user_ids,
                 "RemovedByOwner notification failed; continuing without it"
             );
         }

@@ -372,6 +372,92 @@ use super::*;
         );
     }
 
+    /// Process-global log buffer for the warn-trail tests. The per-poll
+    /// subscriber of `capture_request_logs` loses events when tests run on a
+    /// multi-threaded runtime concurrently, so these tests install one global
+    /// JSON subscriber (WARN level) once and filter on unique markers.
+    #[derive(Clone, Default)]
+    struct SharedWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn global_warn_logs() -> SharedWriter {
+        use std::sync::OnceLock;
+        static WRITER: OnceLock<SharedWriter> = OnceLock::new();
+        WRITER
+            .get_or_init(|| {
+                let writer = SharedWriter::default();
+                let make_writer = writer.clone();
+                let _ = tracing_subscriber::fmt()
+                    .json()
+                    .with_max_level(tracing::Level::WARN)
+                    .with_writer(move || make_writer.clone())
+                    .try_init();
+                writer
+            })
+            .clone()
+    }
+
+    impl SharedWriter {
+        fn find_warn_with_recipients(&self, marker: &str) -> serde_json::Value {
+            let bytes = self.0.lock().expect("log buffer").clone();
+            let text = String::from_utf8(bytes).expect("UTF-8 log output");
+            text.lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find(|event| {
+                    event["fields"]["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("RemovedByOwner notification failed"))
+                        && event["fields"]["recipient_user_ids"]
+                            .as_str()
+                            .is_some_and(|recipients| recipients.contains(marker))
+                })
+                .unwrap_or_else(|| panic!("no WARN naming recipients containing {marker}: {text}"))
+        }
+    }
+
+    #[tokio::test]
+    async fn removed_by_owner_notification_failure_warns_with_recipients() {
+        // Review Focus #4: the WARN trail must name the intended recipients —
+        // an operator diagnosing "the removed party got no system message"
+        // cannot re-derive the friend Bot's current owner after the fact.
+        let logs = global_warn_logs();
+        let (eg, pp, rq, bc, db) = assemble().await;
+        seed_bot(&db, "x:managed", "protected", "protected", "OPEN", "online", Some("85020")).await;
+        seed_bot(&db, "x:friend", "protected", "protected", "OPEN", "online", Some("86300")).await;
+        let svc = service_with_notification(
+            &eg,
+            &pp,
+            &rq,
+            &bc,
+            Arc::new(FailingFriendConnectNotificationPort),
+        );
+        svc.create_connect("x:managed", "x:friend", None, None)
+            .await
+            .expect("bot↔bot friendship");
+
+        let revoked = svc
+            .revoke_friend_as_owner("x:managed", "x:friend", None)
+            .await
+            .expect("the removal itself still succeeds");
+        assert_eq!(revoked.len(), 2, "both friend edges transition");
+        let warn = logs.find_warn_with_recipients("86300");
+        assert_eq!(
+            warn["level"],
+            serde_json::json!("WARN"),
+            "the trail is a WARN, not a silent or error-level line"
+        );
+    }
+
     #[tokio::test]
     async fn removed_by_owner_notification_failure_keeps_the_removal() {
         // Review Focus #4: the work-order intake down → WARN + the removal
